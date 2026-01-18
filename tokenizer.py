@@ -9,6 +9,57 @@ from collections import Counter, defaultdict
 from typing_extensions import override
 import regex as re
 
+def span_encode(text: str, lookup_token: dict):
+    text_bytes = text.encode("utf-8")
+
+    # use spans which are initialized as pairs
+    spans = [(i, i+1) for i in range(len(text_bytes))]
+
+
+    def pair_rank(i):
+        if i < 0 or i >= len(spans) - 1:
+            return float("inf")
+        s0, e0 = spans[i] # span 0 (left)
+        s1, e1 = spans[i+1] # span 1 (right)
+
+        # get the rank (token_id) of the token by direct lookup of the bytes
+        # pair = (text_bytes[s0:e0], text_bytes[s1:e1])
+
+        merged_token = text_bytes[s0:e1]
+
+        rank = lookup_token.get(merged_token, float("inf"))
+        return rank
+
+    # len(span) -1 because len(pairs) == len(span) - 1
+    # len(span) == len(token_ids) (initially)
+    ranks = [pair_rank(i) for i in range(len(spans)-1)] # calculate the rank for every possible pair of spans
+    while ranks:
+        # find the lowest pair
+        # best_pair = min(pairs, key=lambda p: self.merges.get(p, float("inf")))
+        i = min(range(len(ranks)), key=ranks.__getitem__) # i = argmin(ranks)
+        if ranks[i] == float("inf"):
+            # there are no mergeable ranks in the spans we have
+            break
+
+        # token_ids = self.merge(token_ids, best_pair, rank)
+        # merge i and i +1 spans
+        spans[i] = (spans[i][0], spans[i+1][1])
+        spans.pop(i+1)
+
+        # remove rank for merged pair
+        ranks.pop(i)
+
+        # update neighbor ranks
+        if i - 1 >= 0:
+            ranks[i-1] = pair_rank(i-1)
+        if i < len(spans) - 1: # i is the index of the first element of the new span was just created after merging
+            ranks[i] = pair_rank(i)
+            
+    # for pair, id in self.merges.items():
+        # token_ids = self.merge(token_ids, pair, id)
+
+    return [lookup_token[text_bytes[s:e]] for s, e in spans]
+
 class SlowTokenizer:
     def count_bigrams(self, token_ids: List[int]) -> Counter:
         return Counter(list(zip(token_ids, token_ids[1:])))
@@ -47,6 +98,8 @@ class SlowTokenizer:
             self.merges = pickle.load(f)
 
         self.vocab = self.build_vocab(self.merges)
+        self.lookup_token = {token: token_id for token_id, token in self.vocab.items()}
+
 
     def save(self, merges_file="basic_tokenizer.merges.pkl"):
         with open(merges_file, "wb") as f:
@@ -95,6 +148,7 @@ class SlowTokenizer:
         vocab = self.build_vocab(merges)
         self.merges = merges
         self.vocab = vocab
+        self.lookup_token = {token: token_id for token_id, token in self.vocab.items()}
 
         new_token_count = len(token_ids)
 
@@ -104,49 +158,6 @@ class SlowTokenizer:
             print(f"    New Token Count: {new_token_count}")
             print(f"    Vocab Size: {len(vocab)}")
 
-
-    def encode(self, text: str) -> List[int]:
-        token_ids = self.text_to_token_ids(text)
-
-        while True:
-            # find the lowest pair
-            pairs = zip(token_ids, token_ids[1:])
-
-            best_pair = min(pairs, key=lambda p: self.merges.get(p, float("inf")))
-
-            rank = self.merges.get(best_pair)
-
-            if not rank:
-                # no rank is mergeable
-                break
-
-            token_ids = self.merge(token_ids, best_pair, rank)
-                
-
-
-
-        # for pair, id in self.merges.items():
-            # token_ids = self.merge(token_ids, pair, id)
-
-        return token_ids
-    
-    def translate(self, ids) -> List[str]:
-        tokens = []
-        for id in ids:
-            token = self.vocab[id]
-            tokens.append(token.decode("utf-8"))
-        
-        return tokens
-
-    def decode(self, ids: List[int]) -> str:
-        res = []
-        for id in ids:
-            # get the byte mapping for the id from raw utf8 bytes
-            res.append(self.vocab[id])
-
-        return b"".join(res).decode("utf-8", errors="replace") # sometimes llm can output an invalid utf-8 sequence
-
-class BasicTokenizer(SlowTokenizer):
     def encode(self, text: str):
         ids = list(map( int, text.encode("utf-8")))
 
@@ -172,7 +183,28 @@ class BasicTokenizer(SlowTokenizer):
             new_ids = self.merge(ids, best_pair, best_rank)
             ids = new_ids
         return ids
+    
+    def translate(self, ids) -> List[str]:
+        tokens = []
+        for id in ids:
+            token = self.vocab[id]
+            tokens.append(token.decode("utf-8"))
+        
+        return tokens
 
+    def decode(self, ids: List[int]) -> str:
+        res = []
+        for id in ids:
+            # get the byte mapping for the id from raw utf8 bytes
+            res.append(self.vocab[id])
+
+        return b"".join(res).decode("utf-8", errors="replace") # sometimes llm can output an invalid utf-8 sequence
+
+class BasicTokenizer(SlowTokenizer):
+    def encode(self, text: str) -> List[int]:
+        return span_encode(text, self.lookup_token)
+        
+    
 # @dataclass
 # class Node:
 #     token_id: int = 0
@@ -465,44 +497,29 @@ class RegexTokenizer:
         segments = self._segment(text)
         all_ids = []
         for segment in segments:
-            ids = segment.encode("utf-8")
-            if ids in self.token_lookup: # full match
-                # print(f"full match for {ids}")
-                all_ids.append(self.token_lookup[ids])
-                continue
-
-            while True:
-                pairs = zip(ids, ids[1:])
-
-                best_rank = float('inf')
-                # find the best rank pair. we will merge that one
-                best_pair = None
-
-                for pair in pairs:
-                    rank = self.merges.get(pair)
-                    if not rank:
-                        continue
-
-                    if rank < best_rank:
-                        best_rank = rank
-
-                # if best pair is none, there are no more mergeable pairs. lets go to the next segment
-                if not best_pair:
-                    break
-                new_ids = self._merge(ids, pair, best_rank)
-                ids = new_ids
-
-
+            ids = span_encode(segment, self.token_lookup)
             all_ids.extend(ids)
-            # while i < len(ids):
-            #     last_match, last_match_idx = greedy_trie_match(i, self.trie, ids)
-            #     if last_match is not None:
-            #         all_ids.append(last_match)
-            #         i = last_match_idx + 1
-            #     else:
-            #         all_ids.append(ids[i])
-            #         i += 1
-        
+
+            # ids = segment.encode("utf-8")
+            # if ids in self.token_lookup: # full match
+            #     # print(f"full match for {ids}")
+            #     all_ids.append(self.token_lookup[ids])
+            #     continue
+
+            # while True:
+            #     pairs = zip(ids, ids[1:])
+            #     # find the best rank pair. we will merge that one
+            #     best_pair = min(pairs, key=lambda p: self.merges.get(p, float("inf")))
+            #     rank = self.merges.get(best_pair)
+            #     if not rank: # no mergable ranks
+            #         # if rank is none, there are no more mergeable pairs. lets go to the next segment
+            #         break
+
+            #     new_ids = self._merge(ids, best_pair, rank)
+            #     ids = new_ids
+
+
+            # all_ids.extend(ids)
 
         return all_ids
     
